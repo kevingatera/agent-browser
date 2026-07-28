@@ -332,8 +332,9 @@ async fn handle_ws_client(
     // select! below instead of leaving it asleep on a stale deadline.
     let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(initial_config);
     let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
-    // Replies (clipboard reads) go through the writer so ws_tx keeps one owner.
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
+    // Replies from spawned client-message handlers (clipboard reads). The
+    // writer owns ws_tx, so every reply goes out through this channel.
+    let (reply_tx, mut reply_rx) = mpsc::channel::<String>(8);
     // Spawned before the status, tabs and seed writes below: those are
     // unbounded sends, and a full receive queue would otherwise hold input
     // behind the whole handshake.
@@ -343,7 +344,7 @@ async fn handle_ws_client(
         cdp_session_id.clone(),
         config_tx,
         ack_tx,
-        reply_tx,
+        reply_tx.clone(),
         idle_activity.clone(),
     )));
 
@@ -412,7 +413,9 @@ async fn handle_ws_client(
             _ = &mut reader_task.0 => {
                 break;
             }
-            Some(reply) = reply_rx.recv() => {
+            reply = reply_rx.recv() => {
+                // reply_tx is held for the whole loop, so None is unreachable.
+                let Some(reply) = reply else { break };
                 if ws_tx.send(Message::Text(reply)).await.is_err() {
                     break;
                 }
@@ -509,7 +512,7 @@ async fn reader_loop(
     cdp_session_id: Arc<RwLock<Option<String>>>,
     config: watch::Sender<ClientConfig>,
     ack: watch::Sender<u64>,
-    reply_tx: mpsc::UnboundedSender<String>,
+    reply_tx: mpsc::Sender<String>,
     idle_activity: Arc<IdleActivity>,
 ) {
     while let Some(msg) = ws_rx.next().await {
@@ -556,11 +559,7 @@ async fn reader_loop(
                         idle_activity.mark();
                     }
                     let sid = cdp_session_id.read().await;
-                    if let Some(reply) =
-                        dispatch_input(msg_type, &parsed, client.as_ref(), sid.as_deref()).await
-                    {
-                        let _ = reply_tx.send(reply);
-                    }
+                    dispatch_input(msg_type, &parsed, client, sid.as_deref(), &reply_tx).await;
                 }
             }
             Ok(Message::Close(_)) | Err(_) => break,
@@ -629,9 +628,10 @@ fn keyboard_params(parsed: &Value) -> Value {
 async fn dispatch_input(
     msg_type: &str,
     parsed: &Value,
-    client: &CdpClient,
+    client: &Arc<CdpClient>,
     session_id: Option<&str>,
-) -> Option<String> {
+    reply_tx: &mpsc::Sender<String>,
+) {
     match msg_type {
         "input_mouse" => {
             let _ = client
@@ -688,39 +688,47 @@ async fn dispatch_input(
         }
         "input_read_clipboard" => {
             // Copy bridge: read the remote clipboard after a copy/cut so the
-            // dashboard can mirror it into the local clipboard.
-            let result = client
-                .send_command(
-                    "Runtime.evaluate",
-                    Some(json!({
-                        "expression": "navigator.clipboard.readText().then(t => ({ ok: t }), e => ({ err: String(e) }))",
-                        "awaitPromise": true,
-                        "returnByValue": true,
-                    })),
-                    session_id,
-                )
-                .await;
-            let reply = match result {
-                Ok(result) => {
-                    let value = result.get("result").and_then(|r| r.get("value"));
-                    if let Some(text) = value.and_then(|v| v.get("ok")).and_then(|v| v.as_str()) {
-                        json!({ "type": "clipboard", "text": text })
-                    } else {
-                        let err = value
-                            .and_then(|v| v.get("err"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("clipboard read failed");
-                        json!({ "type": "clipboard", "error": err })
+            // dashboard can mirror it into the local clipboard. Spawned
+            // because Runtime.evaluate waits for the page's main thread;
+            // awaiting it inline would stall this client's frames and input
+            // behind a busy page (up to the 30s CDP command timeout).
+            let client = Arc::clone(client);
+            let session_id = session_id.map(|s| s.to_string());
+            let reply_tx = reply_tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .send_command(
+                        "Runtime.evaluate",
+                        Some(json!({
+                            "expression": "navigator.clipboard.readText().then(t => ({ ok: t }), e => ({ err: String(e) }))",
+                            "awaitPromise": true,
+                            "returnByValue": true,
+                        })),
+                        session_id.as_deref(),
+                    )
+                    .await;
+                let reply = match result {
+                    Ok(result) => {
+                        let value = result.get("result").and_then(|r| r.get("value"));
+                        if let Some(text) = value.and_then(|v| v.get("ok")).and_then(|v| v.as_str())
+                        {
+                            json!({ "type": "clipboard", "text": text }).to_string()
+                        } else {
+                            let err = value
+                                .and_then(|v| v.get("err"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("clipboard read failed");
+                            json!({ "type": "clipboard", "error": err }).to_string()
+                        }
                     }
-                }
-                Err(e) => json!({ "type": "clipboard", "error": e }),
-            };
-            return Some(reply.to_string());
+                    Err(e) => json!({ "type": "clipboard", "error": e }).to_string(),
+                };
+                let _ = reply_tx.send(reply).await;
+            });
         }
         "status" => {}
         _ => {}
     }
-    None
 }
 
 fn is_user_input_message_type(msg_type: &str) -> bool {
@@ -918,7 +926,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_input_dispatch_does_not_wait_for_a_cdp_reply() {
         let (url, seen) = silent_cdp_server().await;
-        let client = CdpClient::connect(&url).await.expect("mock cdp connect");
+        let client = Arc::new(CdpClient::connect(&url).await.expect("mock cdp connect"));
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel::<String>(8);
 
         let events = [
             (
@@ -936,7 +945,7 @@ mod tests {
         ];
         let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
             for (kind, payload) in &events {
-                dispatch_input(kind, payload, &client, None).await;
+                dispatch_input(kind, payload, &client, None, &reply_tx).await;
             }
         })
         .await;
