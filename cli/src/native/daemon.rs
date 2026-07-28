@@ -311,6 +311,17 @@ async fn run_socket_server(
                         .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
                     continue;
                 }
+                // A connected dashboard stream is active use of the session;
+                // don't kill it out from under someone watching.
+                if idle_timeout.is_some_and(|t| t.is_default) {
+                    if let Some(ref server) = s.stream_server {
+                        if server.has_connected_clients().await {
+                            idle_sleep_pin = idle_timeout_ms
+                                .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                            continue;
+                        }
+                    }
+                }
                 if idle_timeout.is_some_and(|t| t.is_default) {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -455,6 +466,17 @@ async fn run_socket_server(
                     idle_sleep_pin = idle_timeout_ms
                         .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
                     continue;
+                }
+                // A connected dashboard stream is active use of the session;
+                // don't kill it out from under someone watching.
+                if idle_timeout.is_some_and(|t| t.is_default) {
+                    if let Some(ref server) = s.stream_server {
+                        if server.has_connected_clients().await {
+                            idle_sleep_pin = idle_timeout_ms
+                                .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                            continue;
+                        }
+                    }
                 }
                 if idle_timeout.is_some_and(|t| t.is_default) {
                     let _ = writeln!(
