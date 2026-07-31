@@ -1728,7 +1728,7 @@ Examples:
             r##"
 agent-browser click - Click an element
 
-Usage: agent-browser click <selector> [--new-tab] [--human]
+Usage: agent-browser click <selector> [--button left|right|middle] [--modifiers ctrl,shift] [--new-tab] [--human]
 
 Clicks on the specified element. The selector can be a CSS selector,
 XPath, or an element reference from snapshot (e.g., @e1).
@@ -1737,6 +1737,9 @@ If another element covers the click point, agent-browser reports the
 covering element instead of dispatching a click to the wrong target.
 
 Options:
+  --button <name>      Mouse button: left (default), right, or middle
+  --modifiers <list>   Comma-separated modifiers held during the click:
+                       alt, ctrl, meta, shift
   --new-tab            Open link in a new tab instead of navigating current tab.
                        The new tab inherits session setup before its first load.
                        Only works on elements with an href attribute.
@@ -1754,16 +1757,21 @@ Examples:
   agent-browser click "//button[@type='submit']"
   agent-browser click @e3 --new-tab
   agent-browser click @e3 --human
+  agent-browser click "#menu-item" --button right
+  agent-browser click "#row" --modifiers ctrl,shift
 "##
         }
         "dblclick" => {
             r##"
 agent-browser dblclick - Double-click an element
 
-Usage: agent-browser dblclick <selector>
+Usage: agent-browser dblclick <selector> [--button left|right|middle]
 
 Double-clicks on the specified element. Useful for text selection
 or triggering double-click handlers.
+
+Options:
+  --button <name>      Mouse button: left (default), right, or middle
 
 Global Options:
   --json               Output as JSON
