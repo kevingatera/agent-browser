@@ -6299,6 +6299,10 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    let modifiers = cmd
+        .get("modifiers")
+        .and_then(|v| v.as_i64())
+        .map(|m| m as i32);
 
     let input_mode = cmd
         .get("inputMode")
@@ -6344,6 +6348,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         selector,
         button,
         click_count,
+        modifiers,
         &state.iframe_sessions,
     )
     .await?;
@@ -6367,12 +6372,14 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
 
     let result = interaction::dblclick(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
+        button,
         &state.iframe_sessions,
     )
     .await?;
@@ -7835,6 +7842,7 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         selector,
         "left",
         1,
+        None,
         &state.iframe_sessions,
     )
     .await?;
@@ -10050,6 +10058,7 @@ async fn execute_subaction(
                 selector,
                 "left",
                 1,
+                None,
                 &state.iframe_sessions,
             )
             .await?;
@@ -12895,6 +12904,7 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         AUTH_LOGIN_ELEMENT_REF,
         "left",
         1,
+        None,
         &state.iframe_sessions,
     )
     .await?;
