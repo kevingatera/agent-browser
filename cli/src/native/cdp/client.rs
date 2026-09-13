@@ -442,6 +442,11 @@ impl CdpClient {
         })
     }
 
+    /// True once the reader task has exited, meaning the WebSocket is gone.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     fn ensure_open(&self) -> Result<(), String> {
         if self.closed.load(Ordering::SeqCst) {
             Err(CONNECTION_CLOSED_ERROR.to_string())
