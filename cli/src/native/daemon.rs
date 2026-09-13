@@ -13,7 +13,7 @@ use tokio::sync::{Notify, RwLock};
 
 use super::actions::{
     auto_save_restore_state, close_all_browser_backends, close_current_browser, execute_command,
-    maybe_autosave_restore_state, DaemonState,
+    maybe_autosave_restore_state, maybe_reattach_attached_browser, DaemonState,
 };
 use super::cdp::client::CdpClient;
 use super::state;
@@ -541,6 +541,7 @@ fn spawn_background_tick_if_idle(
         if process_exited {
             let _ = close_current_browser(&mut state).await;
         } else if state.browser.is_some() {
+            maybe_reattach_attached_browser(&mut state).await;
             if let Err(error) = state.drain_cdp_events_background().await {
                 let _ = writeln!(
                     std::io::stderr(),

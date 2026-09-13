@@ -18,6 +18,7 @@ use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
+use super::cdp::discovery::discover_cdp_url;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
     ExceptionThrownEvent, GetFullAXTreeResult, JavascriptDialogOpeningEvent, TargetCreatedEvent,
@@ -742,6 +743,10 @@ pub struct DaemonState {
     /// This is tracked separately from cleanup metadata because provider
     /// plugins are allowed to omit a close-session payload.
     active_provider_connection: bool,
+    /// Throttle/log state for tick-driven re-attach to an externally managed
+    /// browser that was killed and restarted. Attached sessions have no child
+    /// process handle, so `has_process_exited` never fires for them.
+    reattach: ReattachState,
     /// Actions already approved while replaying a confirmed command.
     confirmed_policy_actions: HashSet<String>,
     /// Strict session-to-tab binding (`--pin-tab` / AGENT_BROWSER_PIN_TAB).
@@ -750,6 +755,12 @@ pub struct DaemonState {
     pub pin_tab: bool,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
+}
+
+#[derive(Default)]
+struct ReattachState {
+    last_attempt: Option<std::time::Instant>,
+    notice_logged: bool,
 }
 
 fn default_idle_shutdown_is_blocked(
@@ -859,6 +870,7 @@ impl DaemonState {
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             active_provider_connection: false,
+            reattach: ReattachState::default(),
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
             last_persisted_binding: None,
@@ -2656,6 +2668,95 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
         return Err(err);
     }
     Ok(())
+}
+
+/// Minimum interval between re-attach attempts while an externally managed
+/// browser is down. The tick calls this every 100ms; discovery/connection
+/// failures are fast (connection refused) but each attempt still holds the
+/// state lock, so retry on the order of seconds.
+const REATTACH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Re-attach to an attached (not daemon-launched) browser whose CDP
+/// connection died, e.g. an externally managed Chrome that was killed and
+/// restarted. Called from the daemon tick so the session heals without any
+/// command. Returns true when a re-attach succeeded.
+///
+/// Daemon-launched browsers are handled by `has_process_exited`; provider
+/// and direct-page connections have no HTTP debug endpoint to re-discover.
+pub(crate) async fn maybe_reattach_attached_browser(state: &mut DaemonState) -> bool {
+    let (host, port) = match state.browser.as_ref() {
+        Some(mgr)
+            if mgr.is_cdp_connection()
+                && !mgr.is_direct_page_connection()
+                && mgr.is_connection_lost()
+                && !state.active_provider_connection =>
+        {
+            match mgr.cdp_host_port() {
+                Some(hp) => hp,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+
+    let now = std::time::Instant::now();
+    if state
+        .reattach
+        .last_attempt
+        .is_some_and(|t| now.duration_since(t) < REATTACH_MIN_INTERVAL)
+    {
+        return false;
+    }
+    state.reattach.last_attempt = Some(now);
+
+    // A restarted browser hands out a new webSocketDebuggerUrl UUID, so
+    // re-discover through the HTTP debug endpoint instead of reusing the
+    // cached ws URL (#1272).
+    let ws_url = match discover_cdp_url(&host, port, None).await {
+        Ok(url) => url,
+        Err(_) => {
+            if !state.reattach.notice_logged {
+                state.reattach.notice_logged = true;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[agent-browser] Lost connection to attached browser at {host}:{port}; waiting for it to come back"
+                );
+            }
+            return false;
+        }
+    };
+    let mgr = match BrowserManager::connect_cdp(&ws_url).await {
+        Ok(mgr) => mgr,
+        Err(_) => return false,
+    };
+
+    if let Some(mut old) = state.browser.replace(mgr) {
+        let _ = old.close().await;
+    }
+    state.reset_input_state();
+    state.ref_map = RefMap::new();
+    state.iframe_sessions.clear();
+    state.active_iframe_sessions.clear();
+    state.subscribe_to_browser_events();
+    state.start_fetch_handler();
+    state.start_dialog_handler();
+    state.update_stream_client().await;
+
+    // Network controls (domain filter, proxy auth) live on the connection,
+    // so re-install them when the session had any; on failure the browser is
+    // closed and the next command relaunches (fails closed).
+    let proxy_auth = state.proxy_credentials.read().await.is_some();
+    let has_controls = state.domain_filter.read().await.is_some() || proxy_auth;
+    if has_controls {
+        let _ = install_network_controls_or_close(state, proxy_auth).await;
+    }
+
+    state.reattach = ReattachState::default();
+    let _ = writeln!(
+        std::io::stderr(),
+        "[agent-browser] Re-attached to restarted browser at {host}:{port}"
+    );
+    true
 }
 
 /// Close every browser backend owned by the daemon.
