@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai/react";
-import { ArrowLeft, ArrowRight, Camera, Circle, FileCode, Maximize, Moon, RotateCw, Smartphone, Square, Sun, Wifi, WifiOff } from "lucide-react";
+import { ArrowLeft, ArrowRight, Camera, Circle, FileCode, Keyboard, Maximize, Moon, RotateCw, Smartphone, Square, Sun, Wifi, WifiOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { execCommand, sessionArgs } from "@/lib/exec";
 import { getSessionStreamUrl } from "@/lib/dashboard-routes";
@@ -45,6 +45,16 @@ import {
 } from "@/store/stream";
 import { activeSessionNameAtom, activePortAtom } from "@/store/sessions";
 import { actionErrorAtom, execErrorText, reportActionErrorAtom } from "@/store/action-error";
+import {
+  decayVelocity,
+  FLING_MIN_SPEED,
+  isScrollGesture,
+  releaseVelocity,
+  speed,
+  wheelDelta,
+  type TouchSample,
+  type Velocity,
+} from "@/lib/touch-scroll";
 
 const SCREENCAST_ENGINES = new Set(["chrome"]);
 
@@ -130,6 +140,19 @@ function cdpButton(btn: number): string {
     default: return "none";
   }
 }
+
+// One touch from pointerdown to release. `deltaX`/`deltaY` hold remote-space
+// wheel input not yet sent; `at` is the remote point the wheel is dispatched at.
+type TouchScroll = {
+  pointerId: number;
+  origin: { x: number; y: number };
+  samples: TouchSample[];
+  scrolling: boolean;
+  deltaX: number;
+  deltaY: number;
+  at: { x: number; y: number } | null;
+  frame: number | null;
+};
 
 const DIMENSION_PRESETS: { label: string; ratio?: [number, number] }[] = [
   { label: "1:1", ratio: [1, 1] },
@@ -369,25 +392,31 @@ export function Viewport() {
     await execCommand(args);
   }, [offline, sessionName]);
 
-  const toViewport = useCallback(
-    (e: React.MouseEvent): { x: number; y: number } | null => {
-      const canvas = canvasRef.current;
-      if (!canvas) return null;
-      // Map into the frame's true DIP space (from CDP metadata) when known.
-      // The configured viewport can differ from the actual content area
-      // (window chrome, scrollbars, emulation), and clicks would land off
-      // target if scaled by the wrong dimensions.
+  // Screen px -> remote CSS px for the canvas as drawn. Map into the frame's
+  // true DIP space (from CDP metadata) when known: the configured viewport can
+  // differ from the actual content area (window chrome, scrollbars, emulation),
+  // and clicks would land off target if scaled by the wrong dimensions.
+  const remoteScale = useCallback(
+    (canvas: HTMLCanvasElement) => {
       const targetWidth = frameDeviceWidth > 0 ? frameDeviceWidth : viewportWidth;
       const targetHeight = frameDeviceHeight > 0 ? frameDeviceHeight : viewportHeight;
       const rect = canvas.getBoundingClientRect();
-      const scaleX = targetWidth / rect.width;
-      const scaleY = targetHeight / rect.height;
-      return {
-        x: Math.round((e.clientX - rect.left) * scaleX),
-        y: Math.round((e.clientY - rect.top) * scaleY),
-      };
+      return { rect, x: targetWidth / rect.width, y: targetHeight / rect.height };
     },
     [viewportWidth, viewportHeight, frameDeviceWidth, frameDeviceHeight],
+  );
+
+  const toViewport = useCallback(
+    (e: { clientX: number; clientY: number }): { x: number; y: number } | null => {
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const { rect, x, y } = remoteScale(canvas);
+      return {
+        x: Math.round((e.clientX - rect.left) * x),
+        y: Math.round((e.clientY - rect.top) * y),
+      };
+    },
+    [remoteScale],
   );
 
   const handleMouseEvent = useCallback(
@@ -520,6 +549,228 @@ export function Viewport() {
     [toViewport, sendInput],
   );
 
+  // A finger drag scrolls the remote page: touch has no wheel events, so
+  // without this a phone drag did nothing. A touch that stays inside the slop
+  // is left alone, and the browser's own mouse events turn it into a click.
+  // The canvas is `touch-none`, so the browser does not pan the dashboard.
+  const touchScrollRef = useRef<TouchScroll | null>(null);
+
+  const sendWheel = useCallback(
+    (at: { x: number; y: number }, deltaX: number, deltaY: number) => {
+      sendInput({
+        type: "input_mouse",
+        eventType: "mouseWheel",
+        x: at.x,
+        y: at.y,
+        button: "none",
+        clickCount: 0,
+        deltaX,
+        deltaY,
+        modifiers: 0,
+      });
+    },
+    [sendInput],
+  );
+
+  const stopTouchScroll = useCallback(() => {
+    const s = touchScrollRef.current;
+    if (s?.frame != null) cancelAnimationFrame(s.frame);
+    touchScrollRef.current = null;
+  }, []);
+
+  useEffect(() => () => stopTouchScroll(), [stopTouchScroll]);
+
+  // Sends the drag accumulated since the last frame, so a burst of pointer
+  // moves reaches the remote page as one wheel event per frame.
+  const flushDrag = useCallback(
+    (s: TouchScroll) => {
+      if (s.at && (s.deltaX !== 0 || s.deltaY !== 0)) {
+        sendWheel(s.at, s.deltaX, s.deltaY);
+      }
+      s.deltaX = 0;
+      s.deltaY = 0;
+    },
+    [sendWheel],
+  );
+
+  // Folds one pointer position into the drag. Returns false while the touch is
+  // still inside the slop, so a tap never scrolls.
+  const applyDrag = useCallback(
+    (s: TouchScroll, canvas: HTMLCanvasElement, x: number, y: number, t: number) => {
+      const prev = s.samples[s.samples.length - 1];
+      s.samples.push({ x, y, t });
+      while (s.samples.length > 2 && t - s.samples[0].t > 150) s.samples.shift();
+
+      const wasScrolling = s.scrolling;
+      if (!wasScrolling) {
+        if (!isScrollGesture(x - s.origin.x, y - s.origin.y)) return false;
+        s.scrolling = true;
+      }
+      // The first move past the slop carries the whole travel from the origin,
+      // so the content stays under the finger from the first pixel.
+      const from = wasScrolling ? prev : s.origin;
+      const scale = remoteScale(canvas);
+      s.deltaX += wheelDelta(x - from.x, scale.x);
+      s.deltaY += wheelDelta(y - from.y, scale.y);
+      s.at = toViewport({ clientX: x, clientY: y });
+      return true;
+    },
+    [remoteScale, toViewport],
+  );
+
+  const requestFlush = useCallback(
+    (s: TouchScroll) => {
+      if (s.frame !== null) return;
+      s.frame = requestAnimationFrame(() => {
+        s.frame = null;
+        flushDrag(s);
+      });
+    },
+    [flushDrag],
+  );
+
+  // Coasts after a fast release, decaying until the speed drops below the
+  // threshold. Each frame sends the distance covered since the last frame.
+  const startFling = useCallback(
+    (s: TouchScroll, release: Velocity, scale: { x: number; y: number }) => {
+      let velocity = release;
+      let last = performance.now();
+      const step = (now: number) => {
+        const dt = now - last;
+        last = now;
+        if (s.at) {
+          sendWheel(
+            s.at,
+            wheelDelta(velocity.x * dt, scale.x),
+            wheelDelta(velocity.y * dt, scale.y),
+          );
+        }
+        velocity = decayVelocity(velocity, dt);
+        if (speed(velocity) < FLING_MIN_SPEED) {
+          s.frame = null;
+          if (touchScrollRef.current === s) touchScrollRef.current = null;
+          return;
+        }
+        s.frame = requestAnimationFrame(step);
+      };
+      s.frame = requestAnimationFrame(step);
+    },
+    [sendWheel],
+  );
+
+  const handleTouchStart = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (e.pointerType !== "touch" || !e.isPrimary) return;
+      // A new touch stops any fling still coasting from the last one.
+      stopTouchScroll();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      touchScrollRef.current = {
+        pointerId: e.pointerId,
+        origin: { x: e.clientX, y: e.clientY },
+        samples: [{ x: e.clientX, y: e.clientY, t: performance.now() }],
+        scrolling: false,
+        deltaX: 0,
+        deltaY: 0,
+        at: null,
+        frame: null,
+      };
+    },
+    [stopTouchScroll],
+  );
+
+  const handleTouchMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      const s = touchScrollRef.current;
+      const canvas = canvasRef.current;
+      if (!s || !canvas || e.pointerId !== s.pointerId) return;
+      if (applyDrag(s, canvas, e.clientX, e.clientY, performance.now())) {
+        requestFlush(s);
+      }
+    },
+    [applyDrag, requestFlush],
+  );
+
+  const handleTouchEnd = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      const s = touchScrollRef.current;
+      const canvas = canvasRef.current;
+      if (!s || e.pointerId !== s.pointerId) return;
+      if (!s.scrolling || !canvas) {
+        touchScrollRef.current = null;
+        return;
+      }
+      const now = performance.now();
+      applyDrag(s, canvas, e.clientX, e.clientY, now);
+      if (s.frame !== null) cancelAnimationFrame(s.frame);
+      s.frame = null;
+      flushDrag(s);
+      const release = releaseVelocity(s.samples);
+      if (speed(release) < FLING_MIN_SPEED) {
+        touchScrollRef.current = null;
+        return;
+      }
+      startFling(s, release, remoteScale(canvas));
+    },
+    [applyDrag, flushDrag, remoteScale, startFling],
+  );
+
+  // Phones have no physical keys to fire keydown on the canvas, and the
+  // on-screen keyboard only opens for a focused text field. A hidden textarea
+  // takes the focus instead, and its beforeinput events carry the text.
+  const [touchInput, setTouchInput] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(pointer: coarse)");
+    const update = () => setTouchInput(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+
+  const sendKeyTap = useCallback(
+    (key: string, keyCode: number, text?: string) => {
+      const base = { type: "input_keyboard", key, code: key, windowsVirtualKeyCode: keyCode, modifiers: 0 };
+      sendInput({ ...base, eventType: text ? "keyDown" : "rawKeyDown", text });
+      sendInput({ ...base, eventType: "keyUp" });
+    },
+    [sendInput],
+  );
+
+  const typingRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = typingRef.current;
+    if (!el) return;
+    const onBeforeInput = (e: InputEvent) => {
+      // The textarea never keeps text: everything is forwarded to the remote
+      // page, which owns the focused field.
+      e.preventDefault();
+      switch (e.inputType) {
+        case "insertText":
+        case "insertReplacementText":
+          if (e.data) sendInput({ type: "input_insert_text", text: e.data });
+          break;
+        case "insertLineBreak":
+        case "insertParagraph":
+          sendKeyTap("Enter", 13, "\r");
+          break;
+        case "deleteContentBackward":
+          sendKeyTap("Backspace", 8, "\b");
+          break;
+      }
+    };
+    el.addEventListener("beforeinput", onBeforeInput);
+    return () => el.removeEventListener("beforeinput", onBeforeInput);
+  }, [touchInput, sendInput, sendKeyTap]);
+
+  // Called from a click handler: iOS only opens the keyboard for a focus that
+  // happens inside a user gesture.
+  const toggleTouchKeyboard = useCallback(() => {
+    const el = typingRef.current;
+    if (!el) return;
+    if (document.activeElement === el) el.blur();
+    else el.focus();
+  }, []);
+
   const dispatchKey = useCallback(
     (e: KeyboardEvent, eventType: string) => {
       const info = KEY_INFO[e.key];
@@ -609,6 +860,17 @@ export function Viewport() {
 
   return (
     <div ref={containerRef} className="relative flex h-full flex-col">
+      {touchInput && (
+        <textarea
+          ref={typingRef}
+          aria-label="Text for the remote page"
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
+          className="absolute bottom-0 left-0 h-px w-px resize-none opacity-0"
+        />
+      )}
       {browserConnected && (
         <>
           <div className="flex shrink-0 items-center gap-1.5 px-2 py-1.5">
@@ -618,6 +880,7 @@ export function Viewport() {
                   <button
                     type="button"
                     onClick={() => runCmd("back")}
+                    aria-label="Back"
                     className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
                     <ArrowLeft className="size-4" />
@@ -630,6 +893,7 @@ export function Viewport() {
                   <button
                     type="button"
                     onClick={() => runCmd("forward")}
+                    aria-label="Forward"
                     className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
                     <ArrowRight className="size-4" />
@@ -642,6 +906,7 @@ export function Viewport() {
                   <button
                     type="button"
                     onClick={() => runCmd("reload")}
+                    aria-label="Refresh"
                     className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
                     <RotateCw className="size-3.5" />
@@ -663,7 +928,7 @@ export function Viewport() {
                   }
                 }}
                 className={cn(
-                  "w-full bg-transparent font-mono text-xs text-muted-foreground outline-none placeholder:text-muted-foreground/50",
+                  "w-full bg-transparent font-mono text-base text-muted-foreground outline-none placeholder:text-muted-foreground/50 sm:text-xs",
                   navigating && "opacity-50",
                 )}
                 placeholder="Enter URL..."
@@ -676,6 +941,7 @@ export function Viewport() {
                   <button
                     type="button"
                     onClick={() => runCmd("snapshot")}
+                    aria-label="Snapshot"
                     className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
                     <FileCode className="size-4" />
@@ -688,6 +954,7 @@ export function Viewport() {
                   <button
                     type="button"
                     onClick={() => runCmd("screenshot")}
+                    aria-label="Screenshot"
                     className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
                     <Camera className="size-4" />
@@ -700,6 +967,7 @@ export function Viewport() {
                   <button
                     type="button"
                     onClick={recording ? handleRecordStop : () => setRecordDialogOpen(true)}
+                    aria-label={recording ? "Stop recording" : "Record"}
                     className={cn(
                       "shrink-0 rounded p-1 transition-colors",
                       recording
@@ -712,6 +980,36 @@ export function Viewport() {
                 </TooltipTrigger>
                 <TooltipContent side="bottom"><p>{recording ? "Stop recording" : "Record"}</p></TooltipContent>
               </Tooltip>
+              {!isFit && canvasArea.width > 0 && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Fit page to screen"
+                      onClick={handleFit}
+                      className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:hidden"
+                    >
+                      <Maximize className="size-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom"><p>Fit to screen</p></TooltipContent>
+                </Tooltip>
+              )}
+              {touchInput && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Show keyboard"
+                      onClick={toggleTouchKeyboard}
+                      className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    >
+                      <Keyboard className="size-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom"><p>Keyboard</p></TooltipContent>
+                </Tooltip>
+              )}
             </TooltipProvider>
           </div>
           <Separator />
@@ -723,7 +1021,11 @@ export function Viewport() {
           <canvas
             ref={canvasRef}
             tabIndex={0}
-            className="max-h-full max-w-full object-contain outline-none"
+            className="max-h-full max-w-full touch-none object-contain outline-none"
+            onPointerDown={handleTouchStart}
+            onPointerMove={handleTouchMove}
+            onPointerUp={handleTouchEnd}
+            onPointerCancel={stopTouchScroll}
             onMouseMove={handleMouseMove}
             onMouseDown={(e) => {
               canvasRef.current?.focus();
@@ -760,7 +1062,7 @@ export function Viewport() {
             : "Disconnected"}
         </span>
         {browserConnected && (
-          <span className="text-xs text-muted-foreground/60 font-mono">
+          <span className="hidden min-w-0 truncate text-xs text-muted-foreground/60 font-mono sm:block">
             {getSessionStreamUrl(streamPort)}
           </span>
         )}
