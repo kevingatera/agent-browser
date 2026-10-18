@@ -441,14 +441,21 @@ pub(super) async fn relay_command_to_daemon(
 }
 
 pub(super) fn serve_embedded_file(url_path: &str) -> (&'static str, &'static str, Vec<u8>) {
-    let clean = url_path.trim_start_matches('/');
-    let key = if clean.is_empty() {
+    // The query string (`/?port=...`) and fragment are not part of the file name.
+    let path = url_path.split(['?', '#']).next().unwrap_or("");
+    let clean = path.trim_start_matches('/');
+    let requested = if clean.is_empty() {
         "index.html"
     } else {
         clean
     };
 
-    let file = DashboardAssets::get(key).or_else(|| DashboardAssets::get("index.html"));
+    // Unknown paths are client-side routes: serve the app shell, and type it
+    // as the shell rather than as the route.
+    let (key, file) = match DashboardAssets::get(requested) {
+        Some(content) => (requested, Some(content)),
+        None => ("index.html", DashboardAssets::get("index.html")),
+    };
 
     match file {
         Some(content) => {
@@ -711,5 +718,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(relayed.contains(r#""action":"tabs""#), "{relayed}");
+    }
+}
+
+#[cfg(test)]
+mod embedded_file_tests {
+    use super::*;
+
+    #[test]
+    fn root_with_query_is_served_as_html() {
+        let (status, ct, body) = serve_embedded_file("/?port=41147");
+        assert_eq!(status, "200 OK");
+        assert_eq!(ct, "text/html; charset=utf-8");
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn client_route_is_served_as_the_app_shell() {
+        let (status, ct, _) = serve_embedded_file("/sessions/example");
+        assert_eq!(status, "200 OK");
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn query_and_fragment_are_not_part_of_the_index_name() {
+        let (_, ct, _) = serve_embedded_file("/index.html?x=1#top");
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn embedded_asset_keeps_its_type_with_a_query_string() {
+        let js = DashboardAssets::iter()
+            .find(|name| name.ends_with(".js"))
+            .expect("dashboard build should embed a javascript chunk");
+        let (status, ct, _) = serve_embedded_file(&format!("/{js}?v=1"));
+        assert_eq!(status, "200 OK");
+        assert_eq!(ct, "application/javascript; charset=utf-8");
     }
 }
