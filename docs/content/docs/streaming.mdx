@@ -172,6 +172,8 @@ A `config` message sent later still wins. An unrecognized or unparsable value on
 
 Send input events to control the browser remotely. Mouse, keyboard, and touch input reset the daemon idle timer, and simply having a client connected to the stream also keeps the session alive, so a dashboard or streaming session is not shut down by the default timeout while anyone is watching.
 
+The dashboard viewport on a phone maps touch onto this same input. A one-finger drag sends `mouseWheel` events so the remote page scrolls with the finger and keeps coasting after a fast release. A tap stays a click. The Keyboard button opens the on-screen keyboard and forwards typed text as `input_insert_text`, and Backspace and Enter as key events. Fit resizes the remote viewport to the screen, which is the only control here that changes the page layout for everyone watching.
+
 ### Mouse events
 
 Mouse coordinates are CSS pixels in the page's device-independent pixel (DIP) space. Map positions from the displayed frame using the `metadata.deviceWidth` and `metadata.deviceHeight` of the latest frame message, not the `viewportWidth`/`viewportHeight` from the status message. The status values describe the configured viewport and can differ from the actual content area (window chrome, scrollbars, emulation).
