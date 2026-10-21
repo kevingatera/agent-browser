@@ -50,6 +50,7 @@ pub async fn click(
         selector_or_ref,
         button,
         click_count,
+        modifiers,
         iframe_sessions,
         true,
     )
@@ -64,6 +65,7 @@ async fn click_element(
     selector_or_ref: &str,
     button: &str,
     click_count: i32,
+    modifiers: Option<i32>,
     iframe_sessions: &HashMap<String, String>,
     require_actionable: bool,
 ) -> Result<ClickResult, String> {
