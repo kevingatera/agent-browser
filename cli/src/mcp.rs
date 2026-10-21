@@ -855,6 +855,8 @@ fn tools() -> Vec<Value> {
             json!({
                 "selector": selector_schema(),
                 "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." },
+                "button": mouse_button_schema(),
+                "modifiers": { "type": "string", "description": "Comma-separated keys held during the click: alt, ctrl, meta, shift." },
                 "human": { "type": "boolean", "default": false, "description": "Approach the target with seeded, curved mouse movement." }
             }),
             &["selector"],
@@ -982,7 +984,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_DBLCLICK,
             "Double-click element",
             "Double-click an element.",
-            json!({ "selector": selector_schema() }),
+            json!({ "selector": selector_schema(), "button": mouse_button_schema() }),
             &["selector"],
         ),
         tool(
@@ -2271,7 +2273,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_BACK => call_literal(arguments, &["back"]),
         TOOL_FORWARD => call_literal(arguments, &["forward"]),
         TOOL_RELOAD => call_literal(arguments, &["reload"]),
-        TOOL_DBLCLICK => call_simple_selector(arguments, "dblclick"),
+        TOOL_DBLCLICK => call_dblclick(arguments),
         TOOL_FILL => call_fill(arguments),
         TOOL_TYPE => call_type(arguments),
         TOOL_PRESS => call_press(arguments),
@@ -2727,7 +2729,25 @@ fn click_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     if optional_bool(arguments, "human")?.unwrap_or(false) {
         args.push("--human".to_string());
     }
+    if let Some(button) = optional_string(arguments, "button")? {
+        args.push("--button".to_string());
+        args.push(button);
+    }
+    if let Some(modifiers) = optional_string(arguments, "modifiers")? {
+        args.push("--modifiers".to_string());
+        args.push(modifiers);
+    }
     Ok(args)
+}
+
+fn call_dblclick(arguments: &Value) -> Result<Value, ProtocolError> {
+    let selector = required_string(arguments, "selector")?;
+    let mut args = vec!["dblclick".to_string(), selector];
+    if let Some(button) = optional_string(arguments, "button")? {
+        args.push("--button".to_string());
+        args.push(button);
+    }
+    call_cli_tool(arguments, args, None)
 }
 
 fn call_click(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -4731,6 +4751,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["click", "@e1", "--new-tab"]);
+    }
+
+    #[test]
+    fn click_command_args_include_button_and_modifiers() {
+        let args = click_command_args(&json!({
+            "selector": "#row",
+            "button": "right",
+            "modifiers": "ctrl,shift",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "click",
+                "#row",
+                "--button",
+                "right",
+                "--modifiers",
+                "ctrl,shift"
+            ]
+        );
+    }
+
+    #[test]
+    fn click_and_dblclick_declare_button_and_modifiers() {
+        let click = find_tool(TOOL_CLICK).unwrap();
+        reject_unknown_arguments(
+            TOOL_CLICK,
+            &click,
+            &json!({"selector": "@e1", "button": "right", "modifiers": "alt"}),
+        )
+        .unwrap();
+        let dblclick = find_tool(TOOL_DBLCLICK).unwrap();
+        reject_unknown_arguments(
+            TOOL_DBLCLICK,
+            &dblclick,
+            &json!({"selector": "@e1", "button": "middle"}),
+        )
+        .unwrap();
     }
 
     #[test]
